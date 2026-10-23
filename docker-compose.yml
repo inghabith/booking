@@ -1,0 +1,111 @@
+# Plataforma de reservas: 5 microservicios + worker + Postgres + RabbitMQ.
+#   docker compose up --build
+# Docs de cada API: http://localhost:800X/docs
+#
+# Un solo Postgres, pero cada servicio es dueño exclusivo de SU esquema
+# (users, resources, bookings, payments, notifications) y lo migra él mismo.
+
+x-db-url: &db-url postgresql+psycopg://postgres:postgres@postgres:5432/booking_platform
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: booking_platform
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d booking_platform"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"
+      - "15672:15672" # consola: http://localhost:15672 (guest/guest)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  user-service:
+    build: ./user-service
+    environment:
+      DATABASE_URL: *db-url
+    ports:
+      - "8001:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  resources-service:
+    build: ./resources-service
+    environment:
+      DATABASE_URL: *db-url
+    ports:
+      - "8002:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  booking-service:
+    build: ./booking-service
+    environment:
+      DATABASE_URL: *db-url
+      USERS_SERVICE_URL: http://user-service:8000
+      RESOURCES_SERVICE_URL: http://resources-service:8000
+      EVENT_PUBLISHER: rabbitmq
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
+    ports:
+      - "8003:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  payment-service:
+    build: ./payment-service
+    environment:
+      DATABASE_URL: *db-url
+      BOOKINGS_SERVICE_URL: http://booking-service:8000
+    ports:
+      - "8004:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  notification-service:
+    build: ./notification-service
+    environment:
+      DATABASE_URL: *db-url
+      USERS_SERVICE_URL: http://user-service:8000
+    ports:
+      - "8005:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Misma imagen que notification-service, otro adaptador de entrada (consumidor).
+  notification-worker:
+    build: ./notification-service
+    command: ["python", "-m", "notification_service.presentation.consumers.booking_events_consumer"]
+    environment:
+      DATABASE_URL: *db-url
+      USERS_SERVICE_URL: http://user-service:8000
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
+    depends_on:
+      notification-service:
+        condition: service_started # sus migraciones crean la tabla
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  pgdata:
